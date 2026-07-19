@@ -1,0 +1,37 @@
+---
+# Copy this file locally and replace the placeholders.
+# Do not commit a file that contains real credentials or internal endpoints.
+
+target_hosts: all
+monitoring_base_dir: /opt/monitoring
+monitoring_user: root
+monitoring_group_name: root
+
+deployment_environment: development
+deployment_region: region-1
+monitored_service: example-application
+
+victoria_logs_host: victoria-logs.example.internal
+victoria_logs_port_value: 9428
+victoria_logs_tls_enabled: false
+
+fluent_bit_enabled: true
+blackbox_exporter_enabled: true
+node_exporter_enabled: true
+mysql_exporter_enabled: false
+nginx_exporter_enabled: false
+php_fpm_exporter_enabled: false
+
+nginx_logs: /var/log/nginx/*.log
+php_fpm_logs: /var/log/php-fpm/*.log
+mail_logs: /var/log/maillog
+
+# Supply these securely only when mysql_exporter_enabled=true.
+# mysql_exporter_user: exporter_user
+# mysql_exporter_password: use-rundeck-secure-option-or-ansible-vault
+# mysql_exporter_host: 127.0.0.1
+# mysql_exporter_port: 3306
+
+# Override when status endpoints differ.
+# nginx_status_url: http://127.0.0.1:8080/nginx_status
+# php_fpm_status_uri: tcp://127.0.0.1:9000/status
