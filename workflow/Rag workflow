@@ -1,0 +1,73 @@
+version: 0.2
+
+env:
+  shell: bash
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+    commands:
+      - set -euo pipefail
+      - python --version
+      - python -m pip install --upgrade pip
+      - python -m pip install ruff pytest
+      - if [ -f requirements.txt ]; then python -m pip install -r requirements.txt; fi
+
+  pre_build:
+    commands:
+      - set -euo pipefail
+
+      # Values are configured in the CodeBuild project, not committed to Git.
+      - ': "${RAG_ECR_REPO:?Set RAG_ECR_REPO in CodeBuild environment variables}"'
+      - ': "${STREAMLIT_ECR_REPO:?Set STREAMLIT_ECR_REPO in CodeBuild environment variables}"'
+      - ': "${RAG_CONTAINER_NAME:?Set RAG_CONTAINER_NAME in CodeBuild environment variables}"'
+      - ': "${STREAMLIT_CONTAINER_NAME:?Set STREAMLIT_CONTAINER_NAME in CodeBuild environment variables}"'
+
+      # Non-sensitive repository paths can be overridden from CodeBuild.
+      - RAG_DOCKERFILE="${RAG_DOCKERFILE:-ragkit/Dockerfile}"
+      - RAG_CONTEXT="${RAG_CONTEXT:-ragkit}"
+      - STREAMLIT_DOCKERFILE="${STREAMLIT_DOCKERFILE:-ui/Dockerfile}"
+      - STREAMLIT_CONTEXT="${STREAMLIT_CONTEXT:-ui}"
+
+      - echo "Running lint checks"
+      - ruff check .
+
+      - echo "Running unit tests"
+      - if [ -d tests ]; then pytest -q; else echo "No tests directory found; skipping tests"; fi
+
+      - echo "Logging in to Amazon ECR"
+      - RAG_ECR_REGISTRY="${RAG_ECR_REPO%%/*}"
+      - STREAMLIT_ECR_REGISTRY="${STREAMLIT_ECR_REPO%%/*}"
+      - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$RAG_ECR_REGISTRY"
+      - if [ "$STREAMLIT_ECR_REGISTRY" != "$RAG_ECR_REGISTRY" ]; then aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$STREAMLIT_ECR_REGISTRY"; fi
+
+      # Runtime-generated immutable image tag; no real tag is committed to Git.
+      - SHORT_SHA=$(printf '%s' "${CODEBUILD_RESOLVED_SOURCE_VERSION:-manual}" | cut -c1-8)
+      - IMAGE_TAG="${SHORT_SHA}-${CODEBUILD_BUILD_NUMBER:-0}"
+      - echo "Generated image tag ${IMAGE_TAG}"
+
+  build:
+    commands:
+      - set -euo pipefail
+
+      - echo "Building and pushing the RAG image"
+      - docker build --file "$RAG_DOCKERFILE" --tag "${RAG_ECR_REPO}:${IMAGE_TAG}" "$RAG_CONTEXT"
+      - docker push "${RAG_ECR_REPO}:${IMAGE_TAG}"
+
+      - echo "Building and pushing the Streamlit image"
+      - docker build --file "$STREAMLIT_DOCKERFILE" --tag "${STREAMLIT_ECR_REPO}:${IMAGE_TAG}" "$STREAMLIT_CONTEXT"
+      - docker push "${STREAMLIT_ECR_REPO}:${IMAGE_TAG}"
+
+  post_build:
+    commands:
+      - set -euo pipefail
+      - echo "Creating ECS deployment artifacts"
+      - printf '[{"name":"%s","imageUri":"%s"}]' "$RAG_CONTAINER_NAME" "${RAG_ECR_REPO}:${IMAGE_TAG}" > imagedefinitions-rag.json
+      - printf '[{"name":"%s","imageUri":"%s"}]' "$STREAMLIT_CONTAINER_NAME" "${STREAMLIT_ECR_REPO}:${IMAGE_TAG}" > imagedefinitions-streamlit.json
+      - echo "Build completed successfully"
+
+artifacts:
+  files:
+    - imagedefinitions-rag.json
+    - imagedefinitions-streamlit.json
