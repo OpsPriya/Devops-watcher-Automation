@@ -1,0 +1,462 @@
+---
+- name: Deploy VictoriaMetrics monitoring clients
+  hosts: "{{ target_hosts | default('all') }}"
+  become: true
+  gather_facts: false
+
+  vars:
+    # Generic local installation settings
+    monitoring_dir: "{{ monitoring_base_dir | default('/opt/monitoring') }}"
+    monitoring_owner: "{{ monitoring_user | default('root') }}"
+    monitoring_group: "{{ monitoring_group_name | default('root') }}"
+
+    # Values supplied by Rundeck, inventory, or --extra-vars
+    environment_label: "{{ deployment_environment | default('development') }}"
+    region_label: "{{ deployment_region | default('region-1') }}"
+    service_label: "{{ monitored_service | default(inventory_hostname) }}"
+
+    victoria_logs_port: "{{ victoria_logs_port_value | default(9428) | int }}"
+    victoria_logs_tls: "{{ victoria_logs_tls_enabled | default(false) | bool }}"
+
+    # Log locations can be overridden for each server type.
+    nginx_log_path: "{{ nginx_logs | default('/var/log/nginx/*.log') }}"
+    php_fpm_log_path: "{{ php_fpm_logs | default('/var/log/php-fpm/*.log') }}"
+    mail_log_path: "{{ mail_logs | default('/var/log/maillog') }}"
+
+    # Component switches
+    enable_fluent_bit: "{{ fluent_bit_enabled | default(true) | bool }}"
+    enable_blackbox_exporter: "{{ blackbox_exporter_enabled | default(true) | bool }}"
+    enable_node_exporter: "{{ node_exporter_enabled | default(true) | bool }}"
+    enable_mysql_exporter: "{{ mysql_exporter_enabled | default(false) | bool }}"
+    enable_nginx_exporter: "{{ nginx_exporter_enabled | default(false) | bool }}"
+    enable_php_fpm_exporter: "{{ php_fpm_exporter_enabled | default(false) | bool }}"
+
+    # Container images. Pin these to approved versions in production.
+    fluent_bit_image: "{{ fluent_bit_container_image | default('fluent/fluent-bit:latest') }}"
+    blackbox_exporter_image: "{{ blackbox_container_image | default('prom/blackbox-exporter:latest') }}"
+    node_exporter_image: "{{ node_container_image | default('prom/node-exporter:latest') }}"
+    mysql_exporter_image: "{{ mysql_container_image | default('prom/mysqld-exporter:latest') }}"
+    nginx_exporter_image: "{{ nginx_container_image | default('nginx/nginx-prometheus-exporter:latest') }}"
+    php_fpm_exporter_image: "{{ php_fpm_container_image | default('hipages/php-fpm_exporter:latest') }}"
+
+  pre_tasks:
+    - name: Validate VictoriaLogs host
+      ansible.builtin.assert:
+        that:
+          - victoria_logs_host is defined
+          - victoria_logs_host | string | trim | length > 0
+        fail_msg: >-
+          victoria_logs_host is required. Pass it from Rundeck, inventory,
+          Ansible Vault, or --extra-vars.
+      when: enable_fluent_bit
+
+    - name: Validate MySQL exporter variables
+      ansible.builtin.assert:
+        that:
+          - mysql_exporter_user is defined
+          - mysql_exporter_user | string | trim | length > 0
+          - mysql_exporter_password is defined
+          - mysql_exporter_password | string | length > 0
+        fail_msg: >-
+          mysql_exporter_user and mysql_exporter_password are required when
+          mysql_exporter_enabled=true.
+      when: enable_mysql_exporter
+      no_log: true
+
+    - name: Check Docker installation
+      ansible.builtin.command: docker --version
+      changed_when: false
+
+    - name: Check Docker Compose v2
+      ansible.builtin.command: docker compose version
+      register: docker_compose_v2
+      changed_when: false
+      failed_when: false
+
+    - name: Check Docker Compose v1
+      ansible.builtin.command: docker-compose version
+      register: docker_compose_v1
+      changed_when: false
+      failed_when: false
+
+    - name: Select Docker Compose command
+      ansible.builtin.set_fact:
+        docker_compose_command: >-
+          {{ 'docker compose' if docker_compose_v2.rc == 0 else 'docker-compose' }}
+
+    - name: Fail when Docker Compose is unavailable
+      ansible.builtin.fail:
+        msg: "Docker Compose is not installed on {{ inventory_hostname }}."
+      when:
+        - docker_compose_v2.rc != 0
+        - docker_compose_v1.rc != 0
+
+  tasks:
+    - name: Create monitoring directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ monitoring_owner }}"
+        group: "{{ monitoring_group }}"
+        mode: "0755"
+      loop:
+        - "{{ monitoring_dir }}"
+        - "{{ monitoring_dir }}/fluent-bit"
+        - "{{ monitoring_dir }}/fluent-bit/state"
+        - "{{ monitoring_dir }}/blackbox"
+        - "{{ monitoring_dir }}/node-exporter"
+        - "{{ monitoring_dir }}/mysql-exporter"
+        - "{{ monitoring_dir }}/nginx-exporter"
+        - "{{ monitoring_dir }}/php-fpm-exporter"
+
+    - name: Deploy Fluent Bit Compose file
+      ansible.builtin.copy:
+        dest: "{{ monitoring_dir }}/fluent-bit/compose.yml"
+        owner: "{{ monitoring_owner }}"
+        group: "{{ monitoring_group }}"
+        mode: "0644"
+        content: |
+          services:
+            fluent-bit:
+              image: {{ fluent_bit_image }}
+              restart: unless-stopped
+              volumes:
+                - ./fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
+                - ./nginx.conf:/fluent-bit/etc/nginx.conf:ro
+                - ./php-fpm.conf:/fluent-bit/etc/php-fpm.conf:ro
+                - ./mail.conf:/fluent-bit/etc/mail.conf:ro
+                - ./state:/fluent-bit/state
+                - /var/log:/var/log:ro
+      when: enable_fluent_bit
+
+    - name: Deploy Fluent Bit main configuration
+      ansible.builtin.copy:
+        dest: "{{ monitoring_dir }}/fluent-bit/fluent-bit.conf"
+        owner: "{{ monitoring_owner }}"
+        group: "{{ monitoring_group }}"
+        mode: "0644"
+        content: |
+          [SERVICE]
+              Flush         5
+              Daemon        Off
+              Log_Level     info
+
+          @INCLUDE nginx.conf
+          @INCLUDE php-fpm.conf
+          @INCLUDE mail.conf
+      when: enable_fluent_bit
+
+    - name: Deploy Fluent Bit Nginx log configuration
+      ansible.builtin.copy:
+        dest: "{{ monitoring_dir }}/fluent-bit/nginx.conf"
+        owner: "{{ monitoring_owner }}"
+        group: "{{ monitoring_group }}"
+        mode: "0644"
+        content: |
+          [INPUT]
+              Name              tail
+              Path              {{ nginx_log_path }}
+              Tag               nginx
+              DB                /fluent-bit/state/nginx.db
+              Read_from_Head    Off
+              Refresh_Interval  10
+              Rotate_Wait       30
+              Skip_Long_Lines   On
+              Mem_Buf_Limit     20MB
+
+          [FILTER]
+              Name    modify
+              Match   nginx
+              Add     host {{ inventory_hostname }}
+              Add     environment {{ environment_label }}
+              Add     region {{ region_label }}
+              Add     service {{ service_label }}
+              Add     job nginx
+              Add     agent fluent-bit
+
+          [OUTPUT]
+              Name             http
+              Match            nginx
+              Host             {{ victoria_logs_host }}
+              Port             {{ victoria_logs_port }}
+              URI              /insert/jsonline?_stream_fields=host,environment,region,service,job,agent&_msg_field=log
+              Format           json_lines
+              Json_Date_Key    _time
+              Json_Date_Format iso8601
+              Header           Content-Type application/stream+json
+              tls              {{ 'On' if victoria_logs_tls else 'Off' }}
+              Retry_Limit      False
+      when: enable_fluent_bit
+
+    - name: Deploy Fluent Bit PHP-FPM log configuration
+      ansible.builtin.copy:
+        dest: "{{ monitoring_dir }}/fluent-bit/php-fpm.conf"
+        owner: "{{ monitoring_owner }}"
+        group: "{{ monitoring_group }}"
+        mode: "0644"
+        content: |
+          [INPUT]
+              Name              tail
+              Path              {{ php_fpm_log_path }}
+              Tag               php-fpm
+              DB                /fluent-bit/state/php-fpm.db
+              Read_from_Head    Off
+              Refresh_Interval  10
+              Rotate_Wait       30
+              Skip_Long_Lines   On
+              Mem_Buf_Limit     20MB
+
+          [FILTER]
+              Name    modify
+              Match   php-fpm
+              Add     host {{ inventory_hostname }}
+              Add     environment {{ environment_label }}
+              Add     region {{ region_label }}
+              Add     service {{ service_label }}
+              Add     job php-fpm
+              Add     agent fluent-bit
+
+          [OUTPUT]
+              Name             http
+              Match            php-fpm
+              Host             {{ victoria_logs_host }}
+              Port             {{ victoria_logs_port }}
+              URI              /insert/jsonline?_stream_fields=host,environment,region,service,job,agent&_msg_field=log
+              Format           json_lines
+              Json_Date_Key    _time
+              Json_Date_Format iso8601
+              Header           Content-Type application/stream+json
+              tls              {{ 'On' if victoria_logs_tls else 'Off' }}
+              Retry_Limit      False
+      when: enable_fluent_bit
+
+    - name: Deploy Fluent Bit mail log configuration
+      ansible.builtin.copy:
+        dest: "{{ monitoring_dir }}/fluent-bit/mail.conf"
+        owner: "{{ monitoring_owner }}"
+        group: "{{ monitoring_group }}"
+        mode: "0644"
+        content: |
+          [INPUT]
+              Name              tail
+              Path              {{ mail_log_path }}
+              Tag               mail
+              DB                /fluent-bit/state/mail.db
+              Read_from_Head    Off
+              Refresh_Interval  10
+              Rotate_Wait       30
+              Skip_Long_Lines   On
+              Mem_Buf_Limit     20MB
+
+          [FILTER]
+              Name    modify
+              Match   mail
+              Add     host {{ inventory_hostname }}
+              Add     environment {{ environment_label }}
+              Add     region {{ region_label }}
+              Add     service {{ service_label }}
+              Add     job mail
+              Add     agent fluent-bit
+
+          [OUTPUT]
+              Name             http
+              Match            mail
+              Host             {{ victoria_logs_host }}
+              Port             {{ victoria_logs_port }}
+              URI              /insert/jsonline?_stream_fields=host,environment,region,service,job,agent&_msg_field=log
+              Format           json_lines
+              Json_Date_Key    _time
+              Json_Date_Format iso8601
+              Header           Content-Type application/stream+json
+              tls              {{ 'On' if victoria_logs_tls else 'Off' }}
+              Retry_Limit      False
+      when: enable_fluent_bit
+
+    - name: Deploy Blackbox Exporter configuration
+      ansible.builtin.copy:
+        dest: "{{ monitoring_dir }}/blackbox/blackbox.yml"
+        owner: "{{ monitoring_owner }}"
+        group: "{{ monitoring_group }}"
+        mode: "0644"
+        content: |
+          modules:
+            http_2xx:
+              prober: http
+              timeout: 5s
+              http:
+                method: GET
+                valid_http_versions: ["HTTP/1.1", "HTTP/2.0"]
+                valid_status_codes: [200]
+                follow_redirects: true
+                preferred_ip_protocol: ip4
+
+            tcp_connect:
+              prober: tcp
+              timeout: 5s
+
+            icmp:
+              prober: icmp
+              timeout: 5s
+      when: enable_blackbox_exporter
+
+    - name: Deploy Blackbox Exporter Compose file
+      ansible.builtin.copy:
+        dest: "{{ monitoring_dir }}/blackbox/compose.yml"
+        owner: "{{ monitoring_owner }}"
+        group: "{{ monitoring_group }}"
+        mode: "0644"
+        content: |
+          services:
+            blackbox-exporter:
+              image: {{ blackbox_exporter_image }}
+              restart: unless-stopped
+              ports:
+                - "9115:9115"
+              volumes:
+                - ./blackbox.yml:/etc/blackbox_exporter/config.yml:ro
+              command:
+                - "--config.file=/etc/blackbox_exporter/config.yml"
+      when: enable_blackbox_exporter
+
+    - name: Deploy Node Exporter Compose file
+      ansible.builtin.copy:
+        dest: "{{ monitoring_dir }}/node-exporter/compose.yml"
+        owner: "{{ monitoring_owner }}"
+        group: "{{ monitoring_group }}"
+        mode: "0644"
+        content: |
+          services:
+            node-exporter:
+              image: {{ node_exporter_image }}
+              restart: unless-stopped
+              network_mode: host
+              pid: host
+              volumes:
+                - /:/host:ro,rslave
+              command:
+                - "--path.rootfs=/host"
+                - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+      when: enable_node_exporter
+
+    - name: Deploy MySQL Exporter credentials
+      ansible.builtin.copy:
+        dest: "{{ monitoring_dir }}/mysql-exporter/.my.cnf"
+        owner: "{{ monitoring_owner }}"
+        group: "{{ monitoring_group }}"
+        mode: "0600"
+        content: |
+          [client]
+          user={{ mysql_exporter_user }}
+          password={{ mysql_exporter_password }}
+          host={{ mysql_exporter_host | default('127.0.0.1') }}
+          port={{ mysql_exporter_port | default(3306) }}
+      when: enable_mysql_exporter
+      no_log: true
+
+    - name: Deploy MySQL Exporter Compose file
+      ansible.builtin.copy:
+        dest: "{{ monitoring_dir }}/mysql-exporter/compose.yml"
+        owner: "{{ monitoring_owner }}"
+        group: "{{ monitoring_group }}"
+        mode: "0644"
+        content: |
+          services:
+            mysqld-exporter:
+              image: {{ mysql_exporter_image }}
+              restart: unless-stopped
+              ports:
+                - "9104:9104"
+              volumes:
+                - ./.my.cnf:/cfg/.my.cnf:ro
+              command:
+                - "--config.my-cnf=/cfg/.my.cnf"
+      when: enable_mysql_exporter
+
+    - name: Deploy Nginx Exporter Compose file
+      ansible.builtin.copy:
+        dest: "{{ monitoring_dir }}/nginx-exporter/compose.yml"
+        owner: "{{ monitoring_owner }}"
+        group: "{{ monitoring_group }}"
+        mode: "0644"
+        content: |
+          services:
+            nginx-exporter:
+              image: {{ nginx_exporter_image }}
+              restart: unless-stopped
+              network_mode: host
+              command:
+                - "--nginx.scrape-uri={{ nginx_status_url | default('http://127.0.0.1:8080/nginx_status') }}"
+      when: enable_nginx_exporter
+
+    - name: Deploy PHP-FPM Exporter Compose file
+      ansible.builtin.copy:
+        dest: "{{ monitoring_dir }}/php-fpm-exporter/compose.yml"
+        owner: "{{ monitoring_owner }}"
+        group: "{{ monitoring_group }}"
+        mode: "0644"
+        content: |
+          services:
+            php-fpm-exporter:
+              image: {{ php_fpm_exporter_image }}
+              restart: unless-stopped
+              network_mode: host
+              command:
+                - "--phpfpm.scrape-uri={{ php_fpm_status_uri | default('tcp://127.0.0.1:9000/status') }}"
+      when: enable_php_fpm_exporter
+
+    - name: Start enabled monitoring components
+      ansible.builtin.shell: |
+        set -euo pipefail
+        cd "{{ item.directory }}"
+        {{ docker_compose_command }} -f compose.yml up -d --remove-orphans
+      args:
+        executable: /bin/bash
+      loop:
+        - name: fluent-bit
+          directory: "{{ monitoring_dir }}/fluent-bit"
+          enabled: "{{ enable_fluent_bit }}"
+        - name: blackbox-exporter
+          directory: "{{ monitoring_dir }}/blackbox"
+          enabled: "{{ enable_blackbox_exporter }}"
+        - name: node-exporter
+          directory: "{{ monitoring_dir }}/node-exporter"
+          enabled: "{{ enable_node_exporter }}"
+        - name: mysqld-exporter
+          directory: "{{ monitoring_dir }}/mysql-exporter"
+          enabled: "{{ enable_mysql_exporter }}"
+        - name: nginx-exporter
+          directory: "{{ monitoring_dir }}/nginx-exporter"
+          enabled: "{{ enable_nginx_exporter }}"
+        - name: php-fpm-exporter
+          directory: "{{ monitoring_dir }}/php-fpm-exporter"
+          enabled: "{{ enable_php_fpm_exporter }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: item.enabled | bool
+      register: compose_start_results
+      changed_when: >-
+        'Started' in compose_start_results.stdout or
+        'Created' in compose_start_results.stdout or
+        'Recreated' in compose_start_results.stdout
+
+    - name: List running monitoring containers
+      ansible.builtin.command:
+        argv:
+          - docker
+          - ps
+          - --filter
+          - label=com.docker.compose.project
+          - --format
+          - "{{ '{{' }}.Names{{ '}}' }}\t{{ '{{' }}.Status{{ '}}' }}"
+      register: monitoring_containers
+      changed_when: false
+
+    - name: Display deployment summary
+      ansible.builtin.debug:
+        msg:
+          - "Monitoring clients deployed on {{ inventory_hostname }}"
+          - "Environment: {{ environment_label }}"
+          - "Region: {{ region_label }}"
+          - "Service: {{ service_label }}"
+          - "VictoriaLogs destination configured: {{ enable_fluent_bit }}"
+          - "Running containers: {{ monitoring_containers.stdout_lines }}"
