@@ -1,0 +1,23 @@
+[Unit]
+Description=Site Configuration Inventory Watcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=watcher
+Group=watcher
+WorkingDirectory=/opt/site-config-watcher
+EnvironmentFile=/opt/site-config-watcher/watcher.env
+ExecStart=/opt/site-config-watcher/venv/bin/python /opt/site-config-watcher/watcher.py watch
+Restart=on-failure
+RestartSec=10
+
+# Basic hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
